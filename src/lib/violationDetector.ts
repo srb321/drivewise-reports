@@ -4,56 +4,65 @@ function generateId(): string {
   return Math.random().toString(36).substring(2, 11);
 }
 
-function findPreviousEntryWithDuration(entries: LogEntry[], currentIndex: number): { entry: LogEntry; index: number } | null {
+/**
+ * Find the previous row where duration is present (not empty and > 0)
+ * This is used for odometer diff calculations - we skip rows without duration
+ */
+function findPreviousRowWithDuration(entries: LogEntry[], currentIndex: number): { entry: LogEntry; index: number } | null {
   for (let i = currentIndex - 1; i >= 0; i--) {
-    if (entries[i].durationMinutes > 0) {
+    if (entries[i].duration && entries[i].duration.trim() !== '' && entries[i].durationMinutes > 0) {
       return { entry: entries[i], index: i };
     }
   }
   return null;
 }
 
+/**
+ * Check odometer jumps:
+ * - Find rows where odometer changed
+ * - Look at the previous row WITH duration present
+ * - If that previous row's status was NOT driving, it's a violation
+ */
 function checkOdometerJump(entries: LogEntry[]): Violation[] {
   const violations: Violation[] = [];
   
   for (let i = 1; i < entries.length; i++) {
     const current = entries[i];
-    const previous = entries[i - 1];
     
-    if (current.odometer !== null && previous.odometer !== null) {
-      const diff = current.odometer - previous.odometer;
+    if (current.odometer === null) continue;
+    
+    // Find previous row with duration present
+    const prevWithDuration = findPreviousRowWithDuration(entries, i);
+    
+    if (!prevWithDuration) continue;
+    
+    const prevOdometer = entries[prevWithDuration.index].odometer;
+    
+    if (prevOdometer === null) continue;
+    
+    const odometerDiff = current.odometer - prevOdometer;
+    
+    // If there's an odometer difference
+    if (odometerDiff !== 0 && odometerDiff > 0) {
+      const prevStatus = prevWithDuration.entry.status.toLowerCase();
       
-      if (diff !== 0) {
-        // Find previous entry with duration
-        const prevWithDuration = findPreviousEntryWithDuration(entries, i);
-        
-        if (prevWithDuration) {
-          const refEntry = prevWithDuration.entry;
-          const refOdometer = entries[prevWithDuration.index].odometer;
-          
-          if (refOdometer !== null && current.odometer !== null) {
-            const actualDiff = current.odometer - refOdometer;
-            
-            // Check if status was driving
-            if (refEntry.status.toLowerCase() !== 'driving' && actualDiff > 0) {
-              violations.push({
-                id: generateId(),
-                category: 'Odometer Jump',
-                severity: actualDiff > 50 ? 'Critical' : 'Major',
-                date: current.date,
-                time: current.time,
-                description: `Odometer changed by ${actualDiff.toFixed(1)} miles but status was "${refEntry.status}" (not Driving)`,
-                details: {
-                  currentOdometer: current.odometer,
-                  previousOdometer: refOdometer,
-                  odometerDiff: actualDiff,
-                  duration: refEntry.duration,
-                  status: refEntry.status,
-                },
-              });
-            }
-          }
-        }
+      // If previous row (with duration) status was NOT driving, it's a violation
+      if (prevStatus !== 'driving') {
+        violations.push({
+          id: generateId(),
+          category: 'Odometer Jump',
+          severity: odometerDiff > 50 ? 'Critical' : 'Major',
+          date: current.date,
+          time: current.time,
+          description: `Odometer increased by ${odometerDiff.toFixed(1)} miles but previous status was "${prevWithDuration.entry.status}" (not Driving)`,
+          details: {
+            currentOdometer: current.odometer,
+            previousOdometer: prevOdometer,
+            odometerDiff: odometerDiff,
+            duration: prevWithDuration.entry.duration,
+            status: prevWithDuration.entry.status,
+          },
+        });
       }
     }
   }
@@ -61,6 +70,11 @@ function checkOdometerJump(entries: LogEntry[]): Violation[] {
   return violations;
 }
 
+/**
+ * Check location changes:
+ * - Compare location with previous row
+ * - If location changed and previous row (with duration) status was NOT driving, it's a violation
+ */
 function checkLocationChange(entries: LogEntry[]): Violation[] {
   const violations: Violation[] = [];
   
@@ -68,9 +82,15 @@ function checkLocationChange(entries: LogEntry[]): Violation[] {
     const current = entries[i];
     const previous = entries[i - 1];
     
-    if (current.location && previous.location && current.location !== previous.location) {
-      // Check if previous status was not driving
-      const prevWithDuration = findPreviousEntryWithDuration(entries, i);
+    // Skip if no locations to compare
+    if (!current.location || !previous.location) continue;
+    
+    // Check if location changed (text or numeric values)
+    const locationChanged = current.location.trim().toLowerCase() !== previous.location.trim().toLowerCase();
+    
+    if (locationChanged) {
+      // Find previous row with duration
+      const prevWithDuration = findPreviousRowWithDuration(entries, i);
       
       if (prevWithDuration && prevWithDuration.entry.status.toLowerCase() !== 'driving') {
         violations.push({
@@ -94,37 +114,44 @@ function checkLocationChange(entries: LogEntry[]): Violation[] {
   return violations;
 }
 
+/**
+ * Check stationary while driving:
+ * - If status is "Driving" and duration >= 10 minutes
+ * - But odometer didn't change from previous row
+ * - Show violation
+ */
 function checkStationaryWhileDriving(entries: LogEntry[]): Violation[] {
   const violations: Violation[] = [];
   
-  for (const entry of entries) {
-    if (
-      entry.status.toLowerCase() === 'driving' &&
-      entry.durationMinutes >= 10
-    ) {
-      // Check if odometer changed
-      const entryIndex = entries.indexOf(entry);
-      if (entryIndex > 0) {
-        const previous = entries[entryIndex - 1];
-        if (
-          entry.odometer !== null &&
-          previous.odometer !== null &&
-          entry.odometer === previous.odometer
-        ) {
-          violations.push({
-            id: generateId(),
-            category: 'Stationary While Driving',
-            severity: 'Major',
-            date: entry.date,
-            time: entry.time,
-            description: `Status is "Driving" for ${entry.duration} but odometer unchanged`,
-            details: {
-              currentOdometer: entry.odometer,
-              duration: entry.duration,
-              status: entry.status,
-            },
-          });
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    
+    // Check if status is driving with duration >= 10 minutes
+    if (entry.status.toLowerCase() === 'driving' && entry.durationMinutes >= 10) {
+      // Find previous row with odometer
+      let prevOdometer: number | null = null;
+      for (let j = i - 1; j >= 0; j--) {
+        if (entries[j].odometer !== null) {
+          prevOdometer = entries[j].odometer;
+          break;
         }
+      }
+      
+      // If odometer didn't change
+      if (prevOdometer !== null && entry.odometer !== null && entry.odometer === prevOdometer) {
+        violations.push({
+          id: generateId(),
+          category: 'Stationary While Driving',
+          severity: 'Major',
+          date: entry.date,
+          time: entry.time,
+          description: `Status is "Driving" for ${entry.duration} (${entry.durationMinutes} min) but odometer unchanged at ${entry.odometer}`,
+          details: {
+            currentOdometer: entry.odometer,
+            duration: entry.duration,
+            status: entry.status,
+          },
+        });
       }
     }
   }
@@ -132,9 +159,16 @@ function checkStationaryWhileDriving(entries: LogEntry[]): Violation[] {
   return violations;
 }
 
+/**
+ * Check driving hours exceeded:
+ * - USA: Max 11 hours driving per day
+ * - Canada: Max 13 hours driving per day
+ * - Add up all durations where status is "driving" for each date
+ */
 function checkDrivingHoursExceeded(log: ParsedLog): Violation[] {
   const violations: Violation[] = [];
   const maxHours = log.country === 'Canada' ? 13 : 11;
+  const maxMinutes = maxHours * 60;
   
   // Group entries by date
   const entriesByDate: Record<string, LogEntry[]> = {};
@@ -154,16 +188,16 @@ function checkDrivingHoursExceeded(log: ParsedLog): Violation[] {
       }
     }
     
-    const totalHours = totalDrivingMinutes / 60;
-    
-    if (totalHours > maxHours) {
+    // Violation if even 1 second over (1 minute in our case since we track minutes)
+    if (totalDrivingMinutes > maxMinutes) {
+      const totalHours = totalDrivingMinutes / 60;
       violations.push({
         id: generateId(),
         category: 'Driving Hours Exceeded',
         severity: 'Critical',
         date,
         time: '',
-        description: `Total driving time ${totalHours.toFixed(2)} hours exceeds ${maxHours} hour limit for ${log.country}`,
+        description: `Total driving time ${totalHours.toFixed(2)} hours (${totalDrivingMinutes} min) exceeds ${maxHours} hour limit for ${log.country}`,
         details: {
           totalDrivingHours: totalHours,
           allowedHours: maxHours,
@@ -175,40 +209,73 @@ function checkDrivingHoursExceeded(log: ParsedLog): Violation[] {
   return violations;
 }
 
+/**
+ * Check odometer at date change:
+ * - Store odometer for last row of previous date
+ * - Compare with first row of next date
+ * - If there's a difference, show violation
+ */
 function checkOdometerAtDateChange(entries: LogEntry[]): Violation[] {
   const violations: Violation[] = [];
   
-  let lastDateOdometer: { date: string; odometer: number } | null = null;
+  // Group entries by date and find last odometer for each date
+  const dateOdometers: Record<string, { firstOdometer: number | null; lastOdometer: number | null; firstTime: string; lastTime: string }> = {};
   
   for (const entry of entries) {
+    if (!dateOdometers[entry.date]) {
+      dateOdometers[entry.date] = { firstOdometer: null, lastOdometer: null, firstTime: '', lastTime: '' };
+    }
+    
     if (entry.odometer !== null) {
-      if (lastDateOdometer && lastDateOdometer.date !== entry.date) {
-        const diff = entry.odometer - lastDateOdometer.odometer;
-        
-        if (diff !== 0) {
-          violations.push({
-            id: generateId(),
-            category: 'Odometer Mismatch (Date Change)',
-            severity: 'Major',
-            date: entry.date,
-            time: entry.time,
-            description: `Odometer differs by ${diff.toFixed(1)} miles at date change from ${lastDateOdometer.date} to ${entry.date}`,
-            details: {
-              currentOdometer: entry.odometer,
-              previousOdometer: lastDateOdometer.odometer,
-              odometerDiff: diff,
-            },
-          });
-        }
+      if (dateOdometers[entry.date].firstOdometer === null) {
+        dateOdometers[entry.date].firstOdometer = entry.odometer;
+        dateOdometers[entry.date].firstTime = entry.time;
       }
+      dateOdometers[entry.date].lastOdometer = entry.odometer;
+      dateOdometers[entry.date].lastTime = entry.time;
+    }
+  }
+  
+  // Sort dates in ascending order
+  const sortedDates = Object.keys(dateOdometers).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  
+  // Check continuity between consecutive dates
+  for (let i = 1; i < sortedDates.length; i++) {
+    const prevDate = sortedDates[i - 1];
+    const currDate = sortedDates[i];
+    
+    const prevLastOdometer = dateOdometers[prevDate].lastOdometer;
+    const currFirstOdometer = dateOdometers[currDate].firstOdometer;
+    
+    if (prevLastOdometer !== null && currFirstOdometer !== null) {
+      const diff = currFirstOdometer - prevLastOdometer;
       
-      lastDateOdometer = { date: entry.date, odometer: entry.odometer };
+      if (diff !== 0) {
+        violations.push({
+          id: generateId(),
+          category: 'Odometer Mismatch (Date Change)',
+          severity: 'Major',
+          date: currDate,
+          time: dateOdometers[currDate].firstTime,
+          description: `Odometer differs by ${diff.toFixed(1)} miles between end of ${prevDate} (${prevLastOdometer}) and start of ${currDate} (${currFirstOdometer})`,
+          details: {
+            currentOdometer: currFirstOdometer,
+            previousOdometer: prevLastOdometer,
+            odometerDiff: diff,
+          },
+        });
+      }
     }
   }
   
   return violations;
 }
 
+/**
+ * Check unidentified driving events (Motive format only):
+ * - If format is Motive and there are unidentified events
+ * - If any have status "driving", show all details
+ */
 function checkUnidentifiedDrivingEvents(log: ParsedLog): Violation[] {
   const violations: Violation[] = [];
   
@@ -221,11 +288,12 @@ function checkUnidentifiedDrivingEvents(log: ParsedLog): Violation[] {
           severity: 'Critical',
           date: event.date || log.logDate,
           time: event.time,
-          description: 'Unidentified driving event detected in Motive logs',
+          description: `Unidentified driving event detected - Duration: ${event.duration}, Location: ${event.location || 'Unknown'}`,
           details: {
             currentOdometer: event.odometer ?? undefined,
             duration: event.duration,
             currentLocation: event.location,
+            status: 'Unidentified Driving',
           },
         });
       }
@@ -235,26 +303,35 @@ function checkUnidentifiedDrivingEvents(log: ParsedLog): Violation[] {
   return violations;
 }
 
+/**
+ * Check notes and remarks:
+ * - If notes, comments, or remarks column has values (not empty)
+ * - Show the details of those rows
+ */
 function checkNotesAndRemarks(entries: LogEntry[]): Violation[] {
   const violations: Violation[] = [];
   
   for (const entry of entries) {
-    const hasNotes = entry.notes && entry.notes.trim() !== '';
-    const hasRemarks = entry.remarks && entry.remarks.trim() !== '';
-    const hasComments = entry.comments && entry.comments.trim() !== '';
+    const notes = entry.notes?.trim() || '';
+    const remarks = entry.remarks?.trim() || '';
+    const comments = entry.comments?.trim() || '';
     
-    if (hasNotes || hasRemarks || hasComments) {
+    const allNotes = [notes, remarks, comments].filter(n => n !== '').join(' | ');
+    
+    if (allNotes) {
       violations.push({
         id: generateId(),
         category: 'Notes/Remarks Present',
         severity: 'Minor',
         date: entry.date,
         time: entry.time,
-        description: 'Entry has notes, remarks, or comments that may need review',
+        description: `Entry has notes/remarks that need review`,
         details: {
-          notes: [entry.notes, entry.remarks, entry.comments].filter(Boolean).join(' | '),
+          notes: allNotes,
           status: entry.status,
           duration: entry.duration,
+          currentOdometer: entry.odometer ?? undefined,
+          currentLocation: entry.location,
         },
       });
     }
@@ -263,21 +340,28 @@ function checkNotesAndRemarks(entries: LogEntry[]): Violation[] {
   return violations;
 }
 
+/**
+ * Main analysis function:
+ * - Sort logs by date in ASCENDING order (lowest/oldest first)
+ * - Sort entries within each log by time
+ * - Run all violation checks
+ * - Generate categorized report
+ */
 export function analyzeDriverLogs(logs: ParsedLog[]): AnalysisReport {
   const allViolations: Violation[] = [];
   
-  // Sort logs by date
+  // Sort logs by date in ASCENDING order (oldest first)
   logs.sort((a, b) => new Date(a.logDate).getTime() - new Date(b.logDate).getTime());
   
   for (const log of logs) {
-    // Sort entries by time
+    // Sort entries by time within each log
     log.entries.sort((a, b) => {
       const timeA = a.time || '00:00';
       const timeB = b.time || '00:00';
       return timeA.localeCompare(timeB);
     });
     
-    // Run all violation checks
+    // Run all violation checks in order
     allViolations.push(...checkOdometerJump(log.entries));
     allViolations.push(...checkLocationChange(log.entries));
     allViolations.push(...checkStationaryWhileDriving(log.entries));
@@ -318,7 +402,7 @@ export function analyzeDriverLogs(logs: ParsedLog[]): AnalysisReport {
     }
   }
   
-  dates.sort();
+  dates.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
   
   return {
     generatedAt: new Date().toISOString(),
